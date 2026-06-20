@@ -1,39 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-マーケット・モニター(iPhone / モバイル最適化版)
-
-iPhone だけで動かす方法:
-  1. GitHub にこの market_monitor_app.py と requirements.txt を置く
-  2. share.streamlit.io でそのリポジトリを指定してデプロイ
-  3. 発行された https://〇〇.streamlit.app を Safari で開く
-     (ホーム画面に追加するとアプリのように使えます)
-"""
-
-import time
-from datetime import datetime
-
-import pandas as pd
-import streamlit as st
-
-try:
-    import yfinance as yf
-except ImportError:
-    st.error("yfinance が未インストールです: pip install --upgrade yfinance")
-    st.stop()
-
-# ---------------------------------------------------------------------------
-# ページ設定 & モバイル向けスタイル
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="マーケット・モニター",
-    page_icon="📈",
-    layout="centered",            # スマホでは centered の方が余白が自然
-    initial_sidebar_state="collapsed",
-)
-
-# 画面端の余白を詰め、メトリクスの文字を読みやすく(モバイル調整)
-st.markdown(
     """
     <style>
     .block-container {padding: 1.0rem 0.8rem 2.5rem 0.8rem;}
