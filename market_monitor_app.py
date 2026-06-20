@@ -239,3 +239,135 @@ st.caption(
     "判定: ≧6=強い買い, 2〜5=弱い買い, -1〜1=ノートレード, -2〜-5=弱い売り, ≦-6=強い売り。"
 )
 st.caption("⚠️ 本シグナルは参考情報であり、投資判断や売買成績を保証するものではありません。")
+
+st.divider()
+
+# ===========================================================================
+# 勝率バックテスト(過去5年・各指標の↑↓組み合わせ vs 翌日の日経)
+# ===========================================================================
+st.subheader("勝率バックテスト（過去データ照合）")
+
+# バックテスト対象(日経は現物 ^N225 を採用: 5年分のデータが安定して揃うため)
+_BT_SYMBOLS = {
+    "nikkei": "^N225", "spx": "^GSPC", "ndx": "^IXIC",
+    "usdjpy": "JPY=X", "vix": "^VIX",
+}
+_BT_INVERT = {"nikkei": False, "spx": False, "ndx": False, "usdjpy": False, "vix": True}
+_BUCKETS = ["🔵 強い買い（ロング優勢）", "🟢 弱い買い（押し目狙い）",
+            "🟡 ノートレード（レンジ）", "🟠 弱い売り（戻り売り）", "🔴 強い売り（ショート優勢）"]
+
+
+def _mark_sign(pct, invert):
+    """日次変化率から ↑(+1)/↓(-1)/→(0) を返す(VIXは反転)。"""
+    if pct == 0:
+        return 0
+    rising = pct > 0
+    show_up = rising if not invert else (not rising)
+    return 1 if show_up else -1
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_close_history(symbol, period="5y"):
+    for attempt in range(1, 4):
+        try:
+            df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+            if df is None or df.empty or "Close" not in df.columns:
+                raise ValueError("空")
+            s = df["Close"].dropna()
+            s.index = s.index.tz_localize(None)  # 日付だけで揃える
+            return s
+        except Exception:
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+    return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def run_backtest(period="5y"):
+    closes = {}
+    for k, sym in _BT_SYMBOLS.items():
+        s = _fetch_close_history(sym, period)
+        if s is None:
+            return None
+        closes[k] = s
+    df = pd.DataFrame(closes).dropna()
+    if len(df) < 60:
+        return None
+
+    ret = (df.pct_change() * 100).iloc[1:].copy()
+    # 翌営業日の日経(現物)リターンを各行に割り当て
+    ret["nikkei_next"] = (df["nikkei"].pct_change() * 100).shift(-1).reindex(ret.index)
+    ret["score"] = ret.apply(
+        lambda r: calc_score(r["nikkei"], r["spx"], r["ndx"], r["usdjpy"], r["vix"]), axis=1)
+    ret["bucket"] = ret["score"].apply(signal)
+    ret["pattern"] = ret.apply(
+        lambda r: tuple(_mark_sign(r[k], _BT_INVERT[k])
+                        for k in ["nikkei", "spx", "ndx", "usdjpy", "vix"]), axis=1)
+
+    valid = ret.dropna(subset=["nikkei_next"])
+
+    # スコア帯別の翌日勝率
+    bucket_stats = []
+    for b in _BUCKETS:
+        sub = valid[valid["bucket"] == b]
+        n = len(sub)
+        up = (sub["nikkei_next"] > 0).mean() * 100 if n else None
+        dn = (sub["nikkei_next"] < 0).mean() * 100 if n else None
+        bucket_stats.append({"bucket": b, "n": n, "up": up, "dn": dn})
+
+    span = f"{df.index.min():%Y-%m-%d} 〜 {df.index.max():%Y-%m-%d}（{len(df)}営業日）"
+    return {"valid": valid, "bucket_stats": bucket_stats, "span": span}
+
+
+with st.spinner("過去5年データを取得・集計中..."):
+    bt = run_backtest("5y")
+
+if bt is None:
+    st.error("過去データの取得に失敗しました。少し待ってから「データ更新」で再試行してください。")
+else:
+    st.caption(f"対象期間: {bt['span']} ／ 翌営業日の日経225(現物)の方向で判定")
+
+    # --- 現在の↑↓組み合わせパターンの勝率 ---
+    today_pattern = tuple(
+        _mark_sign(change_map.get(name, 0.0), inv)
+        for name, inv in [("日経225現物", False), ("S&P500", False),
+                          ("NASDAQ", False), ("ドル円", False), ("VIX指数", True)]
+    )
+    valid = bt["valid"]
+    match = valid[valid["pattern"].apply(lambda p: p == today_pattern)]
+    n_match = len(match)
+
+    st.markdown("**現在の組み合わせパターンの勝率**")
+    if n_match == 0:
+        st.info("現在と同じ↑↓パターンの日は、過去5年に該当がありませんでした。"
+                "下のスコア帯別の勝率を参考にしてください。")
+    else:
+        up_rate = (match["nikkei_next"] > 0).mean() * 100
+        dn_rate = (match["nikkei_next"] < 0).mean() * 100
+        b1, b2, b3 = st.columns(3)
+        b1.metric("過去一致回数", f"{n_match} 回")
+        b2.metric("買い勝率(翌日上昇)", f"{up_rate:.1f}%")
+        b3.metric("売り勝率(翌日下落)", f"{dn_rate:.1f}%")
+        if n_match < 20:
+            st.caption("⚠️ サンプル数が少ないため、この勝率は参考程度に。")
+
+    # --- スコア帯別の勝率テーブル ---
+    st.markdown("**スコア帯別の翌日勝率**")
+    bt_table = []
+    for s in bt["bucket_stats"]:
+        is_buy = "買い" in s["bucket"]
+        win = (s["up"] if is_buy else s["dn"]) if s["n"] else None
+        bt_table.append({
+            "判定": s["bucket"],
+            "回数": s["n"],
+            "翌日上昇": f"{s['up']:.1f}%" if s["up"] is not None else "—",
+            "翌日下落": f"{s['dn']:.1f}%" if s["dn"] is not None else "—",
+            "想定勝率": (f"{win:.1f}%" if win is not None else "—"),
+        })
+    st.dataframe(pd.DataFrame(bt_table), use_container_width=True, hide_index=True)
+    st.caption("「想定勝率」= 買い判定はその翌日に上昇した割合、売り判定は下落した割合。")
+
+st.caption(
+    "⚠️ 過去の勝率は将来の成績を保証しません。米国指数(S&P500/NASDAQ/VIX)とドル円は日本市場の"
+    "クローズ後にも動くため、ここでは同一日付の変化で翌営業日の日経を予測する簡易ルールで集計しています。"
+)
