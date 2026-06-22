@@ -144,6 +144,38 @@ def signal(score):
         return "🔴 強い売り（ショート優勢）"
 
 
+# --- Zスコア(標準化スコア) ---
+# 各指標の日次変化を過去の平均・標準偏差で標準化し、重み付け合成して
+# さらに全体を標準化した値。+で買い寄り / -で売り寄り(VIXは符号反転)。
+_Z_KEYS = ["nikkei", "spx", "ndx", "usdjpy", "vix"]
+_Z_WEIGHTS = {"nikkei": 2, "spx": 2, "ndx": 3, "usdjpy": 2, "vix": 3}
+
+
+def zscore_from_changes(changes, stats):
+    """ライブの変化率(dict)と統計(stats)から最終Zスコアを算出。"""
+    zc = {}
+    for k in _Z_KEYS:
+        sd = stats["std"].get(k) or 1.0
+        zc[k] = (changes.get(k, 0.0) - stats["mean"].get(k, 0.0)) / (sd if sd else 1.0)
+    c = (2 * zc["nikkei"] + 2 * zc["spx"] + 3 * zc["ndx"]
+         + 2 * zc["usdjpy"] - 3 * zc["vix"]) / 12.0   # VIXは逆相関で符号反転
+    cstd = stats.get("c_std") or 1.0
+    return (c - stats.get("c_mean", 0.0)) / (cstd if cstd else 1.0)
+
+
+def zsignal(z):
+    if z >= 1.0:
+        return "🔵 強い買い（ロング優勢）"
+    elif z >= 0.4:
+        return "🟢 弱い買い（押し目狙い）"
+    elif z > -0.4:
+        return "🟡 ノートレード（レンジ）"
+    elif z > -1.0:
+        return "🟠 弱い売り（戻り売り）"
+    else:
+        return "🔴 強い売り（ショート優勢）"
+
+
 def _mark_sign(pct, invert):
     if pct == 0:
         return 0
@@ -182,12 +214,21 @@ def run_backtest(period="5y"):
 
     ret = (df.pct_change() * 100).iloc[1:].copy()
     ret["nikkei_next"] = (df["nikkei"].pct_change() * 100).shift(-1).reindex(ret.index)
-    ret["score"] = ret.apply(
-        lambda r: calc_score(r["nikkei"], r["spx"], r["ndx"], r["usdjpy"], r["vix"]), axis=1)
-    ret["bucket"] = ret["score"].apply(signal)
+
+    # --- 各指標を標準化してZスコアを算出 ---
+    means = {k: float(ret[k].mean()) for k in _Z_KEYS}
+    stds = {k: float(ret[k].std()) for k in _Z_KEYS}
+    zdf = pd.DataFrame({k: (ret[k] - means[k]) / (stds[k] or 1.0) for k in _Z_KEYS})
+    c = (2 * zdf["nikkei"] + 2 * zdf["spx"] + 3 * zdf["ndx"]
+         + 2 * zdf["usdjpy"] - 3 * zdf["vix"]) / 12.0
+    c_mean = float(c.mean())
+    c_std = float(c.std())
+    stats = {"mean": means, "std": stds, "c_mean": c_mean, "c_std": c_std}
+
+    ret["zscore"] = (c - c_mean) / (c_std or 1.0)
+    ret["bucket"] = ret["zscore"].apply(zsignal)
     ret["pattern"] = ret.apply(
-        lambda r: tuple(_mark_sign(r[k], _BT_INVERT[k])
-                        for k in ["nikkei", "spx", "ndx", "usdjpy", "vix"]), axis=1)
+        lambda r: tuple(_mark_sign(r[k], _BT_INVERT[k]) for k in _Z_KEYS), axis=1)
 
     valid = ret.dropna(subset=["nikkei_next"])
     bucket_stats = []
@@ -199,7 +240,7 @@ def run_backtest(period="5y"):
         bucket_stats.append({"bucket": b, "n": n, "up": up, "dn": dn})
 
     span = f"{df.index.min():%Y-%m-%d} 〜 {df.index.max():%Y-%m-%d}（{len(df)}営業日）"
-    return {"valid": valid, "bucket_stats": bucket_stats, "span": span}
+    return {"valid": valid, "bucket_stats": bucket_stats, "span": span, "stats": stats}
 
 
 # ===========================================================================
@@ -212,18 +253,25 @@ if st.button("🔄 データ更新", type="primary", use_container_width=True):
 with st.spinner("データ取得中..."):
     rows, fetched_at = fetch_all()
 
-# ライブ値からスコア・判定を算出
+# 各指標のライブ前日比(%)をまとめる
 change_map = {row["name"]: (row["pct"] if row["pct"] is not None else 0.0) for row in rows}
-live_score = calc_score(
-    change_map.get("日経225現物", 0.0), change_map.get("S&P500", 0.0),
-    change_map.get("NASDAQ", 0.0), change_map.get("ドル円", 0.0),
-    change_map.get("VIX指数", 0.0),
-)
-live_result = signal(live_score)
 
-# バックテスト(過去5年)を実行し、現在パターンの勝率を算出
+# バックテスト(過去5年)を実行 → 統計とZスコアを算出
 with st.spinner("過去5年データを集計中..."):
     bt = run_backtest("5y")
+
+# ライブ値からZスコア・判定を算出(統計はバックテスト由来)
+_live_changes = {
+    "nikkei": change_map.get("日経225現物", 0.0), "spx": change_map.get("S&P500", 0.0),
+    "ndx": change_map.get("NASDAQ", 0.0), "usdjpy": change_map.get("ドル円", 0.0),
+    "vix": change_map.get("VIX指数", 0.0),
+}
+if bt is not None:
+    live_z = zscore_from_changes(_live_changes, bt["stats"])
+    live_result = zsignal(live_z)
+else:
+    live_z = None
+    live_result = "履歴取得失敗"
 
 today_pattern = tuple(
     _mark_sign(change_map.get(name, 0.0), inv)
@@ -260,10 +308,15 @@ with top_left:
 
 # --- 右: 総合判定 + 勝率 ---
 with top_right:
-    st.markdown("**総合判定**")
+    st.markdown("**総合判定（Zスコア）**")
     st.metric("判定", live_result)
-    st.metric("スコア", f"{live_score:+d}", help="最大 +12 / 最小 -12")
-    st.progress(int((live_score + 12) / 24 * 100))
+    if live_z is None:
+        st.metric("Zスコア", "—")
+        st.caption("履歴取得失敗のため算出不可")
+    else:
+        st.metric("Zスコア", f"{live_z:+.2f}", help="0=平均的 / +で買い寄り・-で売り寄り（σ単位）")
+        # -2.5〜+2.5 を 0〜100% にマップ
+        st.progress(min(100, max(0, int((live_z + 2.5) / 5 * 100))))
 
     st.markdown("**現パターン勝率**")
     if bt is None:
@@ -328,15 +381,21 @@ with st.container(border=True):
     in_vix = st.number_input("VIX 低下=買い (%)", value=float(change_map.get("VIX指数", 0.0)),
                              step=0.1, format="%.2f")
 
-    manual_score = calc_score(in_nikkei, in_spx, in_ndx, in_usdjpy, in_vix)
-    manual_result = signal(manual_score)
-    mm1, mm2 = st.columns([1, 2])
-    mm1.metric("スコア(入力値)", f"{manual_score:+d}")
-    mm2.metric("判定(入力値)", manual_result)
+    if bt is not None:
+        manual_changes = {"nikkei": in_nikkei, "spx": in_spx, "ndx": in_ndx,
+                          "usdjpy": in_usdjpy, "vix": in_vix}
+        manual_z = zscore_from_changes(manual_changes, bt["stats"])
+        manual_result = zsignal(manual_z)
+        mm1, mm2 = st.columns([1, 2])
+        mm1.metric("Zスコア(入力値)", f"{manual_z:+.2f}")
+        mm2.metric("判定(入力値)", manual_result)
+    else:
+        st.caption("履歴データが取得できないため、Zスコアを計算できません。")
 
 st.caption(
-    "配点: 日経±2 / S&P500±2 / NASDAQ±3 / ドル円(円安+)±2 / VIX±3（VIX低下=+3）。"
-    "判定: ≧6=強い買い, 2〜5=弱い買い, -1〜1=ノートレード, -2〜-5=弱い売り, ≦-6=強い売り。"
+    "Zスコア = 各指標の当日変化率を過去5年の平均・標準偏差で標準化し、"
+    "重み(日経2/S&P2/NASDAQ3/ドル円2/VIX3、VIXは符号反転)で加重平均し、さらに全体を標準化した値。"
+    "判定: Z≧1.0=強い買い, 0.4〜1.0=弱い買い, ±0.4=ノートレード, -1.0〜-0.4=弱い売り, ≦-1.0=強い売り。"
 )
 
 st.divider()
